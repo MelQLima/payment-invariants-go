@@ -1,0 +1,55 @@
+diff --git a/internal/orchestrator/orchestrator.go b/internal/orchestrator/orchestrator.go
+index 7f53f7d..c212197 100644
+--- a/internal/orchestrator/orchestrator.go
++++ b/internal/orchestrator/orchestrator.go
+@@ -116,6 +116,12 @@ func (s *Service) authorize(ctx context.Context, p *payment.Payment, in CreateIn
+ 			Capture: in.Capture, Recurring: in.Recurring, ThreeDSResult: in.ThreeDSResult,
+ 		})
+ 		cancel()
++		if err != nil && ctx.Err() != nil {
++			// The caller gave up (client disconnect or deadline): that says nothing about
++			// the acquirer's health. Do not feed the circuit breaker and do not cascade
++			// to the next acquirer on behalf of a client that is no longer waiting.
++			return ctx.Err()
++		}
+ 		technical := err != nil
+ 		s.Router.Record(prov.Name(), technical, s.Now())
+ 		s.Metrics.Observe("provider_latency_seconds", "Provider call latency", observability.Labels("provider", prov.Name(), "op", "authorize"), observability.Since(start))
+diff --git a/internal/webhook/webhook.go b/internal/webhook/webhook.go
+index 126d207..2ca4359 100644
+--- a/internal/webhook/webhook.go
++++ b/internal/webhook/webhook.go
+@@ -116,11 +116,17 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+ 		return
+ 	}
+ 	key := prov + ":" + p.ID
++	// Reserve the event ID atomically before applying it: two parallel deliveries of the
++	// same event must not both reach the state machine (the second would hit an illegal
++	// transition and answer 5xx).
+ 	h.mu.Lock()
+ 	if h.seen == nil {
+ 		h.seen = map[string]bool{}
+ 	}
+ 	dup := h.seen[key]
++	if !dup {
++		h.seen[key] = true
++	}
+ 	h.mu.Unlock()
+ 	if dup {
+ 		w.WriteHeader(http.StatusOK) // ack duplicates so the provider stops resending
+@@ -129,12 +135,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+ 	err = h.Applier.ApplyNotification(r.Context(), orchestrator.Notification{
+ 		EventID: p.ID, Provider: prov, Reference: p.Reference, Type: p.Type, ReasonCode: p.ReasonCode})
+ 	if err != nil {
++		h.mu.Lock()
++		delete(h.seen, key) // release the reservation so the provider's retry is processed
++		h.mu.Unlock()
+ 		h.Log.ErrorContext(r.Context(), "webhook processing failed; provider will retry", "provider", prov, "event_id", p.ID, "err", err)
+ 		http.Error(w, "processing failed", http.StatusInternalServerError)
+ 		return
+ 	}
+-	h.mu.Lock()
+-	h.seen[key] = true
+-	h.mu.Unlock()
+ 	w.WriteHeader(http.StatusOK)
+ }
